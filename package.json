@@ -1,6 +1,6 @@
 {
   "name": "@phantasma/connect-react",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": false,
   "scripts": {
     "build": "tsc && resolve-tspaths"
@@ -17,7 +17,7 @@
     "lucide-react": "^0.525.0",
     "mobx": "^6.13.7",
     "mobx-react": "^9.2.0",
-    "phantasma-sdk-ts": "^0.1.76",
+    "phantasma-sdk-ts": "^0.2.0-rc.8",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^3.3.1"
   },

@@ -11,3 +11,7 @@ build:
 
 shad CMD:
     npx shadcn@latest {{ CMD }}
+
+[group('publish')]
+publish: build
+    npm publish
