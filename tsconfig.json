@@ -7,8 +7,8 @@
     "jsx": "react-jsx",
 
     /* Modules */
-    "module": "esnext",
-    "moduleResolution": "node",
+    "module": "NodeNext",
+    "moduleResolution": "nodenext",
     // "baseUrl": ".",
     "rootDir": ".",
     "paths": {
