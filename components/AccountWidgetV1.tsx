@@ -14,6 +14,15 @@ export const AccountWidgetV1 = observer((params: {
 
 	useEffect(() => {
 		ctx.restore()
+		const onPageHide = () => {
+			if (ctx.cancel_connecting) {
+				void ctx.cancel_connecting()
+			}
+		}
+		window.addEventListener("pagehide", onPageHide)
+		return () => {
+			window.removeEventListener("pagehide", onPageHide)
+		}
 	}, [])
 
 	function Connect() {
@@ -85,6 +94,9 @@ export const PhaAccountWidgetV1 = observer((params: {
 				},
 				restore: () => {
 					state.restore()
+				},
+				cancel_connecting: () => {
+					state.abort_pending_connect()
 				},
 				is_connecting: state.is_connecting,
 				wallet: state.conn == null ? undefined : pha_econn_to_conn_wallet(state.conn)

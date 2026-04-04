@@ -12,6 +12,15 @@ export type LinkTransportMode = "auto" | "injected" | "local-socket"
 type LinkTransport = Exclude<LinkTransportMode, "auto">
 type FailureClass = "transport" | "wallet"
 
+type SocketHostAttempt = {
+	host: string | null,
+	success: boolean,
+	failure_class: FailureClass | null,
+	failure_message: string | null,
+	socket_transport: string | null,
+	socket_open: boolean,
+}
+
 type PersistConfig = {
 	platform: string,
 	transportMode: LinkTransport,
@@ -41,7 +50,12 @@ type ConnectAttemptDiagnostics = {
 	required_version: number,
 	injected_transport_detected: boolean,
 	local_socket_reachable: boolean | null,
+	browser_family: string | null,
+	public_origin: boolean | null,
+	brave_loopback_permission_suspected: boolean,
+	socket_host_attempts: SocketHostAttempt[],
 	socket_transport: string | null,
+	socket_host: string | null,
 	socket_open: boolean,
 }
 
@@ -54,6 +68,10 @@ type TransportDetection = {
 	injected_transport_detected: boolean,
 	local_socket_reachable: boolean | null,
 	available_transports: LinkTransport[],
+}
+
+type TransportDetectionOptions = {
+	includeLocalSocketProbe?: boolean,
 }
 
 type ConnectAttemptOutcome =
@@ -72,7 +90,9 @@ type ConnectAttemptResult =
 	| {
 			success: true,
 			conn: EasyConnect,
+			hostAttempts: SocketHostAttempt[],
 			socketTransport: string | null,
+			socketHost: string | null,
 			socketOpen: boolean,
 	  }
 	| {
@@ -80,7 +100,9 @@ type ConnectAttemptResult =
 			conn: EasyConnect,
 			message: string,
 			failureClass: FailureClass,
+			hostAttempts: SocketHostAttempt[],
 			socketTransport: string | null,
+			socketHost: string | null,
 			socketOpen: boolean,
 	  }
 
@@ -88,6 +110,7 @@ export type ConnectCtx = {
 	restore: () => void | Promise<void>,
 	connect: () => void | Promise<void>,
 	disconnect: () => void | Promise<void>,
+	cancel_connecting?: () => void | Promise<void>,
 	is_connecting?: boolean,
 	is_disconnecting?: boolean,
 	wallet?: IConnectWallet;
@@ -125,6 +148,7 @@ export class PhaConnectState {
 	selected_transport_mode: LinkTransportMode;
 	available_transports: LinkTransport[] = [];
 	last_connect_diagnostics: ConnectAttemptDiagnostics | null = null;
+	private pending_conn: EasyConnect | null = null;
 
 	constructor(connectOptions: ConnectOptions = {}) {
 		this.connect_options = connectOptions
@@ -159,6 +183,58 @@ export class PhaConnectState {
 
 	private get connect_attempt_timeout_ms(): number {
 		return this.connect_options.connectAttemptTimeoutMs ?? 15000
+	}
+
+	private current_origin_hostname(): string | null {
+		if (typeof window === "undefined") {
+			return null
+		}
+
+		try {
+			return window.location.hostname
+		} catch {
+			return null
+		}
+	}
+
+	private is_public_origin(): boolean | null {
+		const hostname = this.current_origin_hostname()
+		if (hostname == null) {
+			return null
+		}
+
+		const localHostnames = new Set([
+			"localhost",
+			"127.0.0.1",
+			"::1",
+		])
+
+		return !localHostnames.has(hostname)
+	}
+
+	private detect_browser_family(): string | null {
+		if (typeof navigator === "undefined") {
+			return null
+		}
+
+		const userAgent = navigator.userAgent ?? ""
+		if ("brave" in navigator || /\bBrave\//i.test(userAgent)) {
+			return "brave"
+		}
+		if (/\bFirefox\//i.test(userAgent)) {
+			return "firefox"
+		}
+		if (/\bEdg\//i.test(userAgent)) {
+			return "edge"
+		}
+		if (/\bChrome\//i.test(userAgent)) {
+			return "chrome"
+		}
+		if (/\bSafari\//i.test(userAgent)) {
+			return "safari"
+		}
+
+		return null
 	}
 
 	private to_sdk_provider_hint(transport: LinkTransport): "ecto" | "poltergeist" {
@@ -203,6 +279,40 @@ export class PhaConnectState {
 		return refusalIndicators.some((indicator) => normalized.includes(indicator))
 	}
 
+	private should_suspect_brave_loopback_permission_block(
+		transport: LinkTransport,
+		attempt: ConnectAttemptResult,
+	): boolean {
+		if (transport !== "local-socket") {
+			return false
+		}
+		if (attempt.success || attempt.failureClass !== "transport") {
+			return false
+		}
+		if (this.detect_browser_family() !== "brave") {
+			return false
+		}
+		if (this.is_public_origin() !== true) {
+			return false
+		}
+		if (attempt.socketOpen) {
+			return false
+		}
+		if (attempt.hostAttempts.length === 0) {
+			return false
+		}
+
+		return attempt.hostAttempts.every((hostAttempt) =>
+			hostAttempt.success === false &&
+			hostAttempt.socket_transport === "websocket" &&
+			hostAttempt.socket_open === false,
+		)
+	}
+
+	private append_brave_loopback_permission_hint(message: string): string {
+		return `${message}. Brave may be blocking public-site access to localhost wallet sockets. Allow localhost access for this site in brave://settings/content/localhostAccess or use Browser extension mode.`
+	}
+
 	private async probe_local_socket(timeoutMs: number = this.transport_detection_timeout_ms): Promise<boolean> {
 		if (typeof window === "undefined" || typeof WebSocket === "undefined") {
 			return false
@@ -239,13 +349,16 @@ export class PhaConnectState {
 
 	private async detect_available_transports(
 		requestedTransportMode: LinkTransportMode = this.selected_transport_mode,
+		options: TransportDetectionOptions = {},
 	): Promise<TransportDetection> {
+		const includeLocalSocketProbe = options.includeLocalSocketProbe ?? true
 		const injected_transport_detected =
 			typeof window !== "undefined" && "PhantasmaLinkSocket" in window
 		// Explicit modes must not poke the other transport endpoint just to populate
 		// diagnostics. In particular, `I` must not touch the localhost PGL socket.
 		const local_socket_reachable =
-			requestedTransportMode === "auto" || requestedTransportMode === "local-socket"
+			includeLocalSocketProbe &&
+			(requestedTransportMode === "auto" || requestedTransportMode === "local-socket")
 				? await this.probe_local_socket()
 				: null
 		const available_transports: LinkTransport[] = []
@@ -296,26 +409,6 @@ export class PhaConnectState {
 		localStorage.setItem(STORAGE_KEY, JSON.stringify(config))
 	}
 
-	private build_auto_transport_queue(
-		availableTransports: LinkTransport[],
-		savedTransport: LinkTransport | null,
-	): { queue: LinkTransport[], selectionReason: string } {
-		if (savedTransport == null || !availableTransports.includes(savedTransport)) {
-			return {
-				queue: [...availableTransports],
-				selectionReason: "auto-prefer-injected-then-local-socket",
-			}
-		}
-
-		return {
-			queue: [
-				savedTransport,
-				...availableTransports.filter((transport) => transport !== savedTransport),
-			],
-			selectionReason: "auto-prefer-saved-transport-then-fallback",
-		}
-	}
-
 	private resolve_persist_config(conn: EasyConnect): PersistConfig {
 		return {
 			platform: conn.platform,
@@ -338,14 +431,14 @@ export class PhaConnectState {
 
 		// Session restore is an auto-only convenience. Explicit transport modes must wait
 		// for the next user-initiated connect attempt and must not silently reconnect.
+		// They also must not preflight localhost on mount, because background wallet
+		// socket probes change protocol behavior before the user has asked to connect.
 		if (this.selected_transport_mode !== "auto") {
-			void this.refresh_available_transports(this.selected_transport_mode)
 			return
 		}
 
 		const config = this.read_session_config()
 		if (config == null) {
-			void this.refresh_available_transports("auto")
 			return
 		}
 
@@ -367,9 +460,35 @@ export class PhaConnectState {
 		this.restore_from_persist_storage()
 	}
 
-	private async connect_via_transport(
+	private safe_disconnect(conn: EasyConnect | null, message: string) {
+		if (conn == null) {
+			return
+		}
+
+		try {
+			conn.disconnect(message)
+		} catch {
+			// Best-effort cleanup only.
+		}
+	}
+
+	abort_pending_connect() {
+		if (this.pending_conn == null) {
+			return
+		}
+
+		const conn = this.pending_conn
+		this.pending_conn = null
+		this.safe_disconnect(conn, "Abort pending wallet connect")
+	}
+
+	private local_socket_hosts(): string[] {
+		return ["127.0.0.1:7090", "localhost:7090"]
+	}
+
+	private async connect_via_transport_host(
 		transport: LinkTransport,
-		options: { platform: string, requiredVersion: number },
+		options: { platform: string, requiredVersion: number, host: string | null },
 	): Promise<ConnectAttemptResult> {
 		return await new Promise<ConnectAttemptResult>((resolve) => {
 			const conn = new EasyConnect([
@@ -377,7 +496,24 @@ export class PhaConnectState {
 				options.platform,
 				this.to_sdk_provider_hint(transport),
 			])
+			if (options.host != null) {
+				conn.link.host = options.host
+			}
+			this.pending_conn = conn
 			let settled = false
+			const socketHost = conn.link.host ?? options.host ?? null
+			const describeTransportFailure = (message: string) =>
+				transport === "local-socket" && socketHost != null
+					? `${message} (${socketHost})`
+					: message
+			const buildHostAttempt = (result: ConnectAttemptOutcome): SocketHostAttempt => ({
+				host: socketHost,
+				success: result.success,
+				failure_class: result.success ? null : result.failureClass,
+				failure_message: result.success ? null : result.message,
+				socket_transport: conn.link.socketTransport ?? null,
+				socket_open: conn.link.socketOpen,
+			})
 
 			const finalize = (result: ConnectAttemptOutcome) => {
 				if (settled) {
@@ -385,9 +521,17 @@ export class PhaConnectState {
 				}
 				settled = true
 				clearTimeout(timer)
+				if (this.pending_conn === conn) {
+					this.pending_conn = null
+				}
+				if (!result.success) {
+					this.safe_disconnect(conn, "Close failed wallet connect attempt")
+				}
 				resolve({
 					...result,
+					hostAttempts: [buildHostAttempt(result)],
 					socketTransport: conn.link.socketTransport ?? null,
+					socketHost,
 					socketOpen: conn.link.socketOpen,
 				})
 			}
@@ -397,9 +541,11 @@ export class PhaConnectState {
 				finalize({
 					success: false,
 					conn,
-					message: transportEstablished
-						? `${transport} transport timed out after connection was established`
-						: `${transport} transport connection timed out`,
+					message: describeTransportFailure(
+						transportEstablished
+							? `${transport} transport timed out after connection was established`
+							: `${transport} transport connection timed out`,
+					),
 					failureClass: "transport",
 				})
 			}, this.connect_attempt_timeout_ms)
@@ -432,12 +578,59 @@ export class PhaConnectState {
 					finalize({
 						success: false,
 						conn,
-						message,
+						message: describeTransportFailure(message),
 						failureClass: this.classify_failure(message),
 					})
 				},
 			)
 		})
+	}
+
+	private async connect_via_transport(
+		transport: LinkTransport,
+		options: { platform: string, requiredVersion: number },
+	): Promise<ConnectAttemptResult> {
+		const hosts = transport === "local-socket" ? this.local_socket_hosts() : [null]
+		let lastAttempt: ConnectAttemptResult | null = null
+		const hostAttempts: SocketHostAttempt[] = []
+
+		for (let index = 0; index < hosts.length; index++) {
+			const attempt = await this.connect_via_transport_host(transport, {
+				...options,
+				host: hosts[index],
+			})
+			hostAttempts.push(...attempt.hostAttempts)
+			lastAttempt = attempt
+
+			if (attempt.success) {
+				return {
+					...attempt,
+					hostAttempts,
+				}
+			}
+
+			const shouldRetryWithAlternateHost =
+				transport === "local-socket" &&
+				attempt.failureClass === "transport" &&
+				!attempt.socketOpen &&
+				index < hosts.length - 1
+
+			if (!shouldRetryWithAlternateHost) {
+				return {
+					...attempt,
+					hostAttempts,
+				}
+			}
+		}
+
+		if (lastAttempt != null) {
+			return {
+				...lastAttempt,
+				hostAttempts,
+			}
+		}
+
+		throw new Error(`No connection attempts executed for ${transport}`)
 	}
 
 	async connect(configOverride: ConnectOverride = {}) {
@@ -449,16 +642,23 @@ export class PhaConnectState {
 		const requiredVersion = this.connect_options.requiredVersion ?? 4
 
 		this.selected_transport_mode = requestedTransportMode
+		this.abort_pending_connect()
+		if (this.conn != null) {
+			const conn = this.conn
+			this.conn = null
+			this.safe_disconnect(conn, "Replace existing wallet session")
+		}
 		this.err_msg = null
-		this.conn = null
 		this.is_connecting = true
 
-		const detected = await this.detect_available_transports(requestedTransportMode)
-		const savedConfig = requestedTransportMode === "auto" ? this.read_session_config() : null
-		const autoTransportSelection = this.build_auto_transport_queue(
-			detected.available_transports,
-			savedConfig?.transportMode ?? null,
+		// Live connect must not create an extra localhost websocket preflight. That
+		// preflight races with the real wallet socket and is only safe for explicit
+		// diagnostics/UI refreshes.
+		const detected = await this.detect_available_transports(
+			requestedTransportMode,
+			{ includeLocalSocketProbe: false },
 		)
+		const savedConfig = requestedTransportMode === "auto" ? this.read_session_config() : null
 		const diagnostics: ConnectAttemptDiagnostics = {
 			configured_transport_mode: configuredTransportMode,
 			requested_transport_mode: requestedTransportMode,
@@ -469,27 +669,42 @@ export class PhaConnectState {
 			fallback_from: null,
 			fallback_to: null,
 			selection_reason: requestedTransportMode === "auto"
-				? autoTransportSelection.selectionReason
-				: "explicit-transport-mode",
+				? "auto-connect-without-localhost-preflight"
+				: "explicit-transport-mode-without-localhost-preflight",
 			failure_class: null,
 			failure_message: null,
 			platform,
 			required_version: requiredVersion,
 			injected_transport_detected: detected.injected_transport_detected,
 			local_socket_reachable: detected.local_socket_reachable,
+			browser_family: this.detect_browser_family(),
+			public_origin: this.is_public_origin(),
+			brave_loopback_permission_suspected: false,
+			socket_host_attempts: [],
 			socket_transport: null,
+			socket_host: null,
 			socket_open: false,
 		}
 
 		let transportQueue: LinkTransport[] = []
 		if (requestedTransportMode === "auto") {
-			transportQueue = autoTransportSelection.queue
-			// The quick localhost probe is advisory only. Preserve the historical
-			// websocket path by still attempting the real local-socket connect when
-			// auto mode cannot positively detect any transport up front.
-			if (transportQueue.length === 0) {
+			const savedTransport = savedConfig?.transportMode ?? null
+			if (savedTransport === "local-socket") {
+				transportQueue = detected.injected_transport_detected
+					? ["local-socket", "injected"]
+					: ["local-socket"]
+				diagnostics.selection_reason = detected.injected_transport_detected
+					? "auto-prefer-saved-local-socket-then-injected-without-preflight"
+					: "auto-prefer-saved-local-socket-without-preflight"
+			} else if (savedTransport === "injected" && detected.injected_transport_detected) {
+				transportQueue = ["injected", "local-socket"]
+				diagnostics.selection_reason = "auto-prefer-saved-injected-then-local-socket-without-preflight"
+			} else if (detected.injected_transport_detected) {
+				transportQueue = ["injected", "local-socket"]
+				diagnostics.selection_reason = "auto-prefer-injected-then-local-socket-without-preflight"
+			} else {
 				transportQueue = ["local-socket"]
-				diagnostics.selection_reason = "auto-force-local-socket-after-empty-detection"
+				diagnostics.selection_reason = "auto-force-local-socket-without-preflight"
 			}
 		} else {
 			const requestedTransport = this.to_concrete_transport(requestedTransportMode)
@@ -497,10 +712,8 @@ export class PhaConnectState {
 				if (detected.available_transports.includes(requestedTransport)) {
 					transportQueue = [requestedTransport]
 				} else if (requestedTransport === "local-socket") {
-					// Explicit local-socket mode must try the real wallet websocket even if
-					// the preflight probe could not confirm localhost availability.
 					transportQueue = ["local-socket"]
-					diagnostics.selection_reason = "explicit-local-socket-forced"
+					diagnostics.selection_reason = "explicit-local-socket-without-preflight"
 				}
 			}
 		}
@@ -549,7 +762,12 @@ export class PhaConnectState {
 			diagnostics.fallback_used = currentDiagnostics.fallback_used
 			diagnostics.fallback_from = currentDiagnostics.fallback_from
 			diagnostics.fallback_to = currentDiagnostics.fallback_to
+			diagnostics.socket_host_attempts = [
+				...diagnostics.socket_host_attempts,
+				...attempt.hostAttempts,
+			]
 			diagnostics.socket_transport = attempt.socketTransport
+			diagnostics.socket_host = attempt.socketHost
 			diagnostics.socket_open = attempt.socketOpen
 
 			if (attempt.success) {
@@ -566,6 +784,12 @@ export class PhaConnectState {
 
 			diagnostics.failure_class = attempt.failureClass
 			diagnostics.failure_message = attempt.message
+			diagnostics.brave_loopback_permission_suspected =
+				this.should_suspect_brave_loopback_permission_block(transport, attempt)
+
+			if (diagnostics.brave_loopback_permission_suspected) {
+				diagnostics.failure_message = this.append_brave_loopback_permission_hint(attempt.message)
+			}
 			this.last_connect_diagnostics = { ...diagnostics }
 
 			const shouldFallback =
@@ -580,7 +804,7 @@ export class PhaConnectState {
 				continue
 			}
 
-			this.err_msg = attempt.message
+			this.err_msg = diagnostics.failure_message
 			this.is_connecting = false
 			this.clear_session_storage()
 			return
@@ -597,15 +821,20 @@ export class PhaConnectState {
 	}
 
 	set_transport_mode(transportMode: LinkTransportMode) {
+		if (this.is_connecting) {
+			this.abort_pending_connect()
+			this.is_connecting = false
+		}
 		this.selected_transport_mode = this.normalize_transport_mode(transportMode)
 	}
 
 	disconnect() {
-		if (this.conn == null) {
-			return
+		this.abort_pending_connect()
+		if (this.conn != null) {
+			const conn = this.conn
+			this.conn = null
+			this.safe_disconnect(conn, "Graceful Disconect")
 		}
-		this.conn.disconnect()
-		this.conn = null
 		this.err_msg = null
 		this.is_connecting = false
 		this.clear_session_storage()
