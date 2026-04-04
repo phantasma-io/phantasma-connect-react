@@ -484,10 +484,24 @@ export class PhaConnectState {
 		let transportQueue: LinkTransport[] = []
 		if (requestedTransportMode === "auto") {
 			transportQueue = autoTransportSelection.queue
+			// The quick localhost probe is advisory only. Preserve the historical
+			// websocket path by still attempting the real local-socket connect when
+			// auto mode cannot positively detect any transport up front.
+			if (transportQueue.length === 0) {
+				transportQueue = ["local-socket"]
+				diagnostics.selection_reason = "auto-force-local-socket-after-empty-detection"
+			}
 		} else {
 			const requestedTransport = this.to_concrete_transport(requestedTransportMode)
-			if (requestedTransport != null && detected.available_transports.includes(requestedTransport)) {
-				transportQueue = [requestedTransport]
+			if (requestedTransport != null) {
+				if (detected.available_transports.includes(requestedTransport)) {
+					transportQueue = [requestedTransport]
+				} else if (requestedTransport === "local-socket") {
+					// Explicit local-socket mode must try the real wallet websocket even if
+					// the preflight probe could not confirm localhost availability.
+					transportQueue = ["local-socket"]
+					diagnostics.selection_reason = "explicit-local-socket-forced"
+				}
 			}
 		}
 
