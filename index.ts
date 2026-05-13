@@ -116,10 +116,9 @@ export type ConnectCtx = {
 	wallet?: IConnectWallet;
 }
 
-export function pha_econn_to_conn_wallet(conn: EasyConnect): IConnectWallet {
-	return {
-		address: conn.link.account.address,
-	}
+export function pha_econn_to_conn_wallet(conn: EasyConnect): IConnectWallet | undefined {
+	const address = conn.link.account?.address
+	return address == null ? undefined : { address }
 }
 
 function formatConnectError(res: unknown): string | null {
